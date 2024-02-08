@@ -1,0 +1,26 @@
+{
+    "toolList": [
+        {
+            "autoTool": true,
+            "name": "Interact",
+            "previewRenderable": "$GAME_DATA/Character/Char_Tools/char_connecttool_preview.rend",
+            "previewRotation": [
+                1,
+                0,
+                0,
+                0,
+                0,
+                -1,
+                0,
+                1,
+                0
+            ],
+            "script": {
+                "class": "Interact",
+                "data": {},
+                "file": "$CONTENT_DATA/Scripts/Interact.lua"
+            },
+            "uuid": "29b5be60-4554-4d86-9ef3-ec774b208691"
+        }
+    ]
+}
