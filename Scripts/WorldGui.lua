@@ -1,8 +1,50 @@
+dofile "$SURVIVAL_DATA/Scripts/util.lua"
+
 local vec3 = sm.vec3.new
 local quat_zero = sm.quat.identity()
 local baseWidgetScale = sm.vec3.one() * 0.25
 local guiScaleMultiplier = 0.25 * 0.01
 local guiScaleMultiplier_half = guiScaleMultiplier * 0.5
+
+local DEBUG_SLIDER_HITBOX = false
+
+---@param gui WorldGuiInterface
+---@param widgets { [string]: WorldGuiLayoutWidget }
+---@param parent? string
+local function CreateWidgets(gui, widgets, parent)
+    for name, data in pairs(widgets) do
+        local effect = sm.effect.createEffect("ShapeRenderable")
+        local skinData = WorldGui.skins[data.skin]
+        effect:setParameter("uuid", sm.uuid.new(skinData.uuid))
+        effect:setParameter("color", sm.color.new(skinData.colour))
+
+        gui.widgets[name] = {
+            effect = effect,
+            skin = data.skin,
+            widgetType = data.widgetType,
+            widgetData = data.widgetData or {},
+            transform = data.transform,
+            parent = parent,
+            zIndex = 0,
+        }
+
+        if data.children then
+            CreateWidgets(gui, data.children, name)
+        end
+    end
+end
+
+---@param hierarchy table
+---@param widgets { [string]: WorldGuiLayoutWidget }
+local function AssembleHierarchy(hierarchy, widgets)
+    for name, data in pairs(widgets) do
+        hierarchy[name] = {}
+
+        if data.children then
+            AssembleHierarchy(hierarchy[name], data.children)
+        end
+    end
+end
 
 ---@param gui WorldGuiInterface
 ---@param widgetName string
@@ -18,45 +60,55 @@ local function CalculateZIndex(gui, widgetName)
 end
 
 ---@param gui WorldGuiInterface
----@param widgetName string
----@param customTrans? WorldGuiTransform
-local function CalculateTransform(gui, widgetName, customTrans)
-    local widget = gui.widgets[widgetName]
-    local transform = shallowcopy(customTrans or widget.transform)
-    while (widget.parent ~= nil) do
-        local parent = widget.parent
-        local parentTransform = gui.widgets[parent].transform
-        local parentRot = parentTransform.rotation
+---@param name string
+---@param pos_x number
+---@param pos_y number
+---@param rotation Quat
+---@return number, number, Quat
+local function CalculateTransform(gui, name, pos_x, pos_y, rotation)
+    pos_x = pos_x or 0
+    pos_y = pos_y or 0
+    rotation = rotation or quat_zero
 
-        local newPos = (parentRot * vec3(transform.pos_x, 0, transform.pos_y) + vec3(parentTransform.pos_x, 0, parentTransform.pos_y))
-        transform.pos_x = newPos.x
-        transform.pos_y = newPos.z
+    local widget = gui.widgets[name]
+    local transform = widget.transform
+    local newPos = (rotation * vec3(transform.pos_x, 0, transform.pos_y) + vec3(pos_x, 0, pos_y))
 
-        transform.rotation = parentRot * transform.rotation
-
-        widget = gui.widgets[parent]
-    end
-
-    return transform
+    return newPos.x, newPos.z, rotation * transform.rotation
 end
 
-local function OnUnHoverButton(self)
-    local button = self.hoverWidget:getUserData().button
-    local widget = self.widgets[button]
-    if widget.data.isPressed then
-        WorldGui.OnInteract(self.id, button, false)
+---@param gui WorldGuiInterface
+---@param name string
+---@param children { [string]: string[] }
+local function RenderWidget(gui, name, children, pos_x, pos_y, rotation)
+    local widget = gui.widgets[name]
+
+    local transform = widget.transform
+    local effect = widget.effect
+    local widgetTypeCallbacks = WorldGui.widgetTypeCallbacks[widget.widgetType] or {}
+
+    local pos_x_new, pos_y_new, rotation_new
+    if widgetTypeCallbacks.recalculateTransform then
+        pos_x_new, pos_y_new, rotation_new = widgetTypeCallbacks.recalculateTransform(gui, name, widget, pos_x, pos_y, rotation, effect, transform)
+    else
+        pos_x_new, pos_y_new, rotation_new = CalculateTransform(gui, name, pos_x, pos_y, rotation)
     end
 
-    widget.effect:setParameter("color", sm.color.new(WorldGui.skins[widget.skin].colour))
-    self.hoverWidget = nil
+    effect:setPosition(gui.position + gui.rotation * vec3(pos_x_new, widget.zIndex, pos_y_new) * guiScaleMultiplier * gui.scale)
+    effect:setRotation(gui.rotation * rotation_new)
+    effect:setScale(baseWidgetScale * vec3(transform.scale_x, 1, transform.scale_y) * 0.01 * gui.scale)
 
-    sm.tool.forceTool(nil)
+    for child, childChildren in pairs(children) do
+        RenderWidget(gui, child, childChildren, pos_x_new, pos_y_new, rotation_new)
+    end
 end
 
+if WorldGui == nil then
+    WorldGui = {}
+    ---@type WorldGuiInterface[]
+    WorldGui.activeLayouts = WorldGui.activeLayouts or {}
+end
 
-
-WorldGui = {}
-WorldGui.activeLayouts = {}
 WorldGui.skins = {
     TransparentBG = {
         uuid = "5f41af56-df4c-4837-9b3c-10781335757f",
@@ -88,21 +140,6 @@ WorldGui.skins = {
     }
 }
 
---https://math.stackexchange.com/a/1905794
----@param A Vec3 The point
----@param B Vec3 First point of the line
----@param C Vec3 Second point of the line
----@return Vec3
-local function DistanceToPointFromLine(A, B, C)
-    local d = (C - B):normalize()
-    local v = A - B
-    local t = v:dot(d)
-    local P = B + d * t
-
-    local dir = A - P--; dir.z = 0
-    return dir
-end
-
 WorldGui.widgetTypeCallbacks = {
     slider = {
         ---@param gui WorldGuiInterface
@@ -127,46 +164,65 @@ WorldGui.widgetTypeCallbacks = {
                 self.player = state and player or nil
             end
         end,
-        update = function(gui, name, data, scale, result)
-            local widgetData = data.data
+        ---@param gui WorldGuiInterface
+        ---@param name string
+        ---@param data WorldGuiWidget
+        ---@param result RaycastResult
+        update = function(gui, name, data, result)
+            local widgetData = data.widgetData
             if widgetData.player and result.type == "areaTrigger" then
-                local transform = data.transform
-                local maxRange = widgetData.maxRange
-                local pos_x = transform.pos_x + (widgetData.isFlipped and maxRange or -maxRange) * 0.5
-                local up = CalculateTransform(gui, name, { pos_x = pos_x, pos_y = transform.pos_y + transform.scale_y * 0.5, scale_x = 0, scale_y = 0, rotation = transform.rotation })
-                local down = CalculateTransform(gui, name, { pos_x = pos_x, pos_y = transform.pos_y - transform.scale_y * 0.5, scale_x = 0, scale_y = 0, rotation = transform.rotation })
-                local realPos_up = gui.position + gui.rotation * vec3(up.pos_x, data.zIndex, up.pos_y) * guiScaleMultiplier * scale
-                local realPos_down = gui.position + gui.rotation * vec3(down.pos_x, data.zIndex, down.pos_y) * guiScaleMultiplier * scale
-                local distance = DistanceToPointFromLine(result.pointWorld, realPos_up, realPos_down)
-
-                widgetData.sliderFraction = sm.util.clamp(distance:length() * 400 / maxRange * (1 / scale), 0, 1)
+                local localPos = result.pointWorld - widgetData.trigger:getWorldPosition()
+                local scale = gui.scale
+                widgetData.sliderFraction = sm.util.clamp((0.38 * scale + (widgetData.isFlipped and -localPos.x or localPos.x)) * 400 / widgetData.maxRange * (1 / scale), 0, 1)
             end
         end,
-        recalculateTransform = function(gui, name, data, position, rotation, scale, effect, transform)
-            local widgetData = data.data
+        ---@param gui WorldGuiInterface
+        ---@param name string
+        ---@param data WorldGuiWidget
+        ---@param pos_x number
+        ---@param pos_y number
+        ---@param rotation Quat
+        ---@param effect Effect
+        ---@param transform WorldGuiTransform
+        recalculateTransform = function(gui, name, data, pos_x, pos_y, rotation, effect, transform)
+            local scale = gui.scale
+            local widgetData = data.widgetData
             local width = sm.util.lerp(0, widgetData.maxRange, widgetData.sliderFraction)
-            local newTransform = CalculateTransform(
-                gui, name, { pos_x = transform.pos_x + (widgetData.isFlipped and (-width + widgetData.maxRange) or (width - widgetData.maxRange)) * 0.5,
-                pos_y = transform.pos_y, scale_x = width, scale_y = transform.scale_y, rotation = transform.rotation }
-            )
 
+            effect:setScale(baseWidgetScale * vec3(width, 1, transform.scale_y) * 0.01 * scale)
             transform.scale_x = width
 
-            effect:setPosition(position + rotation * vec3(newTransform.pos_x, data.zIndex, newTransform.pos_y) * guiScaleMultiplier * scale)
-            effect:setRotation(rotation * newTransform.rotation)
-            effect:setScale(baseWidgetScale * vec3(width, 1, transform.scale_y) * 0.01 * scale)
+            local pos_x_new, pos_y_new, rotation_new = CalculateTransform(gui, name, pos_x, pos_y, rotation)
 
-            local trigger = widgetData.trigger --[[@as AreaTrigger]]
-            local triggerTransform = CalculateTransform(gui, name, { pos_x = transform.pos_x, pos_y = transform.pos_y, scale_x = width, scale_y = transform.scale_y, rotation = transform.rotation })
-            trigger:setWorldPosition(position + rotation * vec3(triggerTransform.pos_x, data.zIndex, triggerTransform.pos_y) * guiScaleMultiplier * scale)
-            trigger:setWorldRotation(rotation * triggerTransform.rotation)
+            ---@type AreaTrigger
+            local trigger = widgetData.trigger
+            trigger:setWorldPosition(gui.position + gui.rotation * vec3(pos_x_new, data.zIndex, pos_y_new) * guiScaleMultiplier * scale)
+            trigger:setWorldRotation(gui.rotation * rotation_new)
             trigger:setSize(baseWidgetScale * vec3(widgetData.maxRange, 1, transform.scale_y) * 0.01 * 0.5 * scale)
+
+            if DEBUG_SLIDER_HITBOX then
+                if not gui.vis then
+                    local eff = sm.effect.createEffect("ShapeRenderable")
+                    eff:setParameter("uuid", sm.uuid.new(WorldGui.skins.Black.uuid))
+                    eff:setParameter("visualization", true)
+                    eff:start()
+
+                    gui.vis = eff
+                end
+
+                gui.vis:setPosition(trigger:getWorldPosition())
+                gui.vis:setRotation(trigger:getWorldRotation())
+                gui.vis:setScale(trigger:getSize() * 2)
+            end
+
+            local offset = rotation_new * vec3((widgetData.isFlipped and (-width + widgetData.maxRange) or (width - widgetData.maxRange)) * 0.5, 0, 0)
+            return CalculateTransform(gui, name, pos_x + offset.x, pos_y + offset.z, rotation)
         end,
         ---@param gui WorldGuiInterface
         ---@param name string
         ---@param data WorldGuiWidget
         destroy = function(gui, name, data)
-            sm.areaTrigger.destroy(data.data.trigger)
+            sm.areaTrigger.destroy(data.widgetData.trigger)
         end,
         ---@param gui WorldGuiInterface
         ---@param name string
@@ -195,8 +251,9 @@ WorldGui.widgetTypeCallbacks = {
         ---@param gui WorldGuiInterface
         ---@param name string
         ---@param data WorldGuiWidget
-        update = function(gui, name, data, scale)
-            local trigger = data.data.trigger --[[@as AreaTrigger]]
+        update = function(gui, name, data)
+            local scale = gui.scale
+            local trigger = data.widgetData.trigger --[[@as AreaTrigger]]
             trigger:setWorldPosition(gui.position + gui.rotation * vec3(data.transform.pos_x, data.zIndex, data.transform.pos_y) * guiScaleMultiplier * scale)
             trigger:setWorldRotation(gui.rotation * data.transform.rotation)
             trigger:setSize(vec3(data.transform.scale_x, 1, data.transform.scale_y) * guiScaleMultiplier_half * scale)
@@ -205,7 +262,7 @@ WorldGui.widgetTypeCallbacks = {
         ---@param name string
         ---@param data WorldGuiWidget
         destroy = function(gui, name, data)
-            sm.areaTrigger.destroy(data.data.trigger)
+            sm.areaTrigger.destroy(data.widgetData.trigger)
         end,
         ---@param gui WorldGuiInterface
         ---@param name string
@@ -222,6 +279,7 @@ WorldGui.widgetTypeCallbacks = {
 ---@field widgetData? table
 ---@field transform WorldGuiTransform
 ---@field parent? string
+---@field children? WorldGuiLayoutWidget
 
 ---@alias WorldGuiLayout { [string]: WorldGuiLayoutWidget }
 
@@ -242,16 +300,16 @@ local eventBindings =
 function WorldGui.OnInteract(guiId, widgetName, state, player)
     ---@type WorldGuiWidget
     local widget = WorldGui.activeLayouts[guiId].widgets[widgetName]
-    if state == widget.data.isPressed then return end
+    if state == widget.widgetData.isPressed then return end
 
-    widget.data.isPressed = state
+    widget.widgetData.isPressed = state
     if state then
         widget.effect:setParameter("color", sm.color.new(WorldGui.skins[widget.skin].pressColour))
     else
         widget.effect:setParameter("color", sm.color.new(WorldGui.skins[widget.skin].hoverColour))
     end
 
-    for k, callbackData in pairs(widget.data.callbacks) do
+    for k, callbackData in pairs(widget.widgetData.callbacks) do
         local obj = callbackData.obj
         local eventFunction = eventBindings[type(obj)]
         if eventFunction then
@@ -273,8 +331,8 @@ end
 ---@class WorldGuiWidget
 ---@field effect Effect
 ---@field skin string
----@field type string
----@field data table
+---@field widgetType string
+---@field widgetData table
 ---@field transform WorldGuiTransform
 ---@field parent? string
 ---@field zIndex number
@@ -282,18 +340,20 @@ end
 ---@class WorldGuiInterface
 ---@field id number
 ---@field widgets { [string]: WorldGuiWidget }
+---@field hierarchy { [string]: string[] }
 ---@field position Vec3
 ---@field rotation Quat
+---@field scale number
 ---@field hoverWidget AreaTrigger?
 ---@field open function
 ---@field close function
 ---@field destroy function
----@field recalculateTransform function
 ---@field setPosition function
 ---@field setRotation function
+---@field setScale function
 ---@field setWidgetPosition function
 ---@field setWidgetRotation function
----@field update function
+---@field setWidgetZIndex function
 ---@field bindButtonCallback function
 ---@field getWidget function
 ---@field setSliderFraction function
@@ -303,13 +363,15 @@ end
 ---@param position Vec3
 ---@param rotation Quat
 ---@return WorldGuiInterface
-function WorldGui.createGui(layout, position, rotation)
+function WorldGui.createGui(layout, position, rotation, scale)
     ---@type WorldGuiInterface
     local gui = {
         id = 0,
         widgets = {},
+        hierarchy = {},
         rotation = rotation,
         position = position,
+        scale = scale or 1,
         hoverWidget = nil,
         ---@param self WorldGuiInterface
         open = function(self)
@@ -328,7 +390,7 @@ function WorldGui.createGui(layout, position, rotation)
             for name, data in pairs(self.widgets) do
                 data.effect:destroy()
 
-                local widgetTypeCallbacks = WorldGui.widgetTypeCallbacks[data.type] or {}
+                local widgetTypeCallbacks = WorldGui.widgetTypeCallbacks[data.widgetType] or {}
                 if widgetTypeCallbacks.destroy then
                     widgetTypeCallbacks.destroy(self, name, data)
                 end
@@ -337,97 +399,42 @@ function WorldGui.createGui(layout, position, rotation)
             WorldGui.activeLayouts[self.id] = nil
         end,
         ---@param self WorldGuiInterface
-        recalculateTransform = function(self, position, rotation, scale)
-            scale = scale or 1
-            for name, data in pairs(self.widgets) do
-                local transform = data.transform
-                local effect = data.effect
-                local widgetTypeCallbacks = WorldGui.widgetTypeCallbacks[data.type] or {}
-                if widgetTypeCallbacks.recalculateTransform then
-                    widgetTypeCallbacks.recalculateTransform(self, name, data, position, rotation, scale, effect, transform)
-                else
-                    local newTransform = CalculateTransform(self, name)
-                    effect:setPosition(position + rotation * vec3(newTransform.pos_x, data.zIndex, newTransform.pos_y) * guiScaleMultiplier * scale)
-                    effect:setRotation(rotation * newTransform.rotation)
-                    effect:setScale(baseWidgetScale * vec3(transform.scale_x, 1, transform.scale_y) * 0.01 * scale)
-                end
-            end
-
-            self.position = position
-            self.rotation = rotation
-        end,
-        ---@param self WorldGuiInterface
         setPosition = function(self, position)
             self.position = position
-            self:recalculateTransform(position, self.rotation)
         end,
         ---@param self WorldGuiInterface
         setRotation = function(self, rotation)
             self.rotation = rotation
-            self:recalculateTransform(self.position, rotation)
+        end,
+        ---@param self WorldGuiInterface
+        setScale = function(self, scale)
+            self.scale = scale
         end,
         ---@param self WorldGuiInterface
         setWidgetPosition = function(self, widgetName, position)
             local widget = self.widgets[widgetName]
             widget.transform.pos_x = position.x
             widget.transform.pos_y = position.y
-            --widget.effect:setPosition(self.position + self.rotation * vec3(position.x, widget.parent and 0.1 or 0, position.y) * guiScaleMultiplier)
         end,
         ---@param self WorldGuiInterface
         setWidgetRotation = function(self, widgetName, rotation)
            local widget = self.widgets[widgetName]
            widget.transform.rotation = rotation
-           --widget.effect:setRotation(self.rotation * rotation)
         end,
         ---@param self WorldGuiInterface
-        update = function(self, position, rotation, scale)
-            scale = scale or 1
-            self:recalculateTransform(position or self.position, rotation or self.rotation, scale)
-
-            local camPos = sm.camera.getDefaultPosition()
-            local hit, result = sm.physics.raycast(camPos, camPos + sm.localPlayer.getDirection() * 7.5, nil, sm.physics.filter.areaTrigger)
-            if result.type == "areaTrigger" then
-                local trigger = result:getAreaTrigger()
-                if sm.exists(trigger) then
-                    if self.hoverWidget and self.hoverWidget ~= trigger then
-                        OnUnHoverButton(self)
-                    end
-
-                    local userdata = trigger:getUserData()
-                    if self.id == userdata.guiId then
-                        local widget = self.widgets[userdata.button]
-
-                        local text = "Interact"
-                        local widgetTypeCallbacks = WorldGui.widgetTypeCallbacks[widget.type] or {}
-                        if widgetTypeCallbacks.interactionText then
-                            text = widgetTypeCallbacks.interactionText(self, userdata.button, widget)
-                        end
-                        sm.gui.setInteractionText("", sm.gui.getKeyBinding("Create", true), text)
-
-                        if not self.hoverWidget then
-                            self.hoverWidget = trigger
-                            widget.effect:setParameter("color", sm.color.new(WorldGui.skins[widget.skin].hoverColour))
-
-                            sm.tool.forceTool(sm.worldgui_interact)
-                        end
-                    end
-                end
-            elseif self.hoverWidget then
-                OnUnHoverButton(self)
-            end
-
-            for name, data in pairs(self.widgets) do
-                local widgetTypeCallbacks = WorldGui.widgetTypeCallbacks[data.type] or {}
-                if widgetTypeCallbacks.update then
-                    widgetTypeCallbacks.update(self, name, data, scale, result)
-                end
+        setWidgetZIndex = function(self, widgetName, index)
+            local widget = self.widgets[widgetName]
+            if widget then
+                widget.zIndex = index
+            else
+                sm.log.warning(("No '%s' button found in world interface!"):format(widgetName))
             end
         end,
         ---@param self WorldGuiInterface
         bindButtonCallback = function(self, widgetName, obj, callback)
             local widget = self.widgets[widgetName]
-            if widget and widget.type == "button" then
-                table.insert(widget.data.callbacks, { obj = obj, callback = callback })
+            if widget and widget.widgetType == "button" then
+                table.insert(widget.widgetData.callbacks, { obj = obj, callback = callback })
             else
                 sm.log.warning(("No '%s' button found in world interface!"):format(widgetName))
             end
@@ -443,8 +450,8 @@ function WorldGui.createGui(layout, position, rotation)
         ---@param fraction number
         setSliderFraction = function(self, widgetName, fraction)
             local widget = self.widgets[widgetName]
-            if widget and widget.type == "slider" then
-                widget.data.sliderFraction = fraction
+            if widget and widget.widgetType == "slider" then
+                widget.widgetData.sliderFraction = fraction
             else
                 sm.log.warning(("No '%s' slider found in world interface!"):format(widgetName))
             end
@@ -454,8 +461,8 @@ function WorldGui.createGui(layout, position, rotation)
         ---@return number fraction
         getSliderFraction = function(self, widgetName)
             local widget = self.widgets[widgetName]
-            if widget and widget.type == "slider" then
-                return widget.data.sliderFraction
+            if widget and widget.widgetType == "slider" then
+                return widget.widgetData.sliderFraction
             end
 
             sm.log.warning(("No '%s' slider found in world interface!"):format(widgetName))
@@ -463,36 +470,20 @@ function WorldGui.createGui(layout, position, rotation)
         end
     }
 
-    for name, data in pairs(layout) do
-        local effect = sm.effect.createEffect("ShapeRenderable")
-        local skinData = WorldGui.skins[data.skin]
-        effect:setParameter("uuid", sm.uuid.new(skinData.uuid))
-        effect:setParameter("color", sm.color.new(skinData.colour))
-
-        gui.widgets[name] = {
-            effect = effect,
-            skin = data.skin,
-            type = data.widgetType,
-            data = data.widgetData or {},
-            transform = data.transform,
-            parent = data.parent,
-            zIndex = 0,
-        }
-    end
+    CreateWidgets(gui, layout)
+    AssembleHierarchy(gui.hierarchy, layout)
 
     gui.id = #WorldGui.activeLayouts + 1
 
     for name, data in pairs(gui.widgets) do
         data.zIndex = CalculateZIndex(gui, name)
 
-        local widgetData = data.data
-        local widgetTypeCallbacks = WorldGui.widgetTypeCallbacks[data.type] or {}
+        local widgetData = data.widgetData
+        local widgetTypeCallbacks = WorldGui.widgetTypeCallbacks[data.widgetType] or {}
         if widgetTypeCallbacks.create then
             widgetTypeCallbacks.create(gui, name, data, widgetData, position, rotation)
         end
     end
-
-    gui:recalculateTransform(position, rotation)
 
     table.insert(WorldGui.activeLayouts, gui)
 
@@ -502,3 +493,74 @@ end
 
 
 sm.worldgui = WorldGui
+
+
+
+---@class WorldGuiManager : ToolClass
+WorldGuiManager = class()
+
+function WorldGuiManager:client_onUpdate()
+    --sm.tool.forceTool(nil)
+
+    if #WorldGui.activeLayouts == 0 then return end
+
+    local camPos = sm.camera.getDefaultPosition()
+    local hit, result = sm.physics.raycast(camPos, camPos + sm.localPlayer.getDirection() * 7.5, nil, sm.physics.filter.areaTrigger)
+    if result.type == "areaTrigger" then
+        local trigger = result:getAreaTrigger()
+        if sm.exists(trigger) then
+            if self.hoverWidget and self.hoverWidget ~= trigger then
+                self:OnUnHoverButton()
+            end
+
+            local userdata = trigger:getUserData()
+            local gui = WorldGui.activeLayouts[userdata.guiId]
+            local widget = gui.widgets[userdata.button]
+
+            local text = "Interact"
+            local widgetTypeCallbacks = WorldGui.widgetTypeCallbacks[widget.widgetType] or {}
+            if widgetTypeCallbacks.interactionText then
+                text = widgetTypeCallbacks.interactionText(gui, userdata.button, widget)
+            end
+            sm.gui.setInteractionText("", sm.gui.getKeyBinding("Create", true), text)
+
+            if not self.hoverWidget then
+                self.hoverWidget = trigger
+                widget.effect:setParameter("color", sm.color.new(WorldGui.skins[widget.skin].hoverColour))
+
+                sm.tool.forceTool(sm.worldgui_interact)
+            end
+        end
+    elseif self.hoverWidget then
+        self:OnUnHoverButton()
+    end
+
+    for k, layout in pairs(WorldGui.activeLayouts) do
+        for name, children in pairs(layout.hierarchy) do
+            RenderWidget(layout, name, children)
+        end
+
+        for name, data in pairs(layout.widgets) do
+            local widgetTypeCallbacks = WorldGui.widgetTypeCallbacks[data.widgetType] or {}
+            if widgetTypeCallbacks.update then
+                widgetTypeCallbacks.update(layout, name, data, result)
+            end
+        end
+    end
+end
+
+function WorldGuiManager:OnUnHoverButton()
+    if sm.exists(self.hoverWidget) then
+        local gui = WorldGui.activeLayouts[self.hoverWidget:getUserData().guiId]
+        local button = self.hoverWidget:getUserData().button
+        local widget = gui.widgets[button]
+        if widget.widgetData.isPressed then
+            WorldGui.OnInteract(gui.id, button, false)
+        end
+
+        widget.effect:setParameter("color", sm.color.new(WorldGui.skins[widget.skin].colour))
+    end
+
+    self.hoverWidget = nil
+    sm.tool.forceTool(nil)
+end
