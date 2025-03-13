@@ -2,7 +2,9 @@
 Interact = class()
 
 function Interact:client_onCreate()
-    sm.worldgui_interact = self.tool
+    if self.tool:isLocal() then
+        sm.worldgui_interact = self.tool
+    end
 end
 
 function Interact:client_onEquippedUpdate(lmb, rmb, f)
@@ -24,7 +26,8 @@ function Interact:cl_tryUpdateButton(state)
         if sm.exists(trigger) then
             local userdata = trigger:getUserData()
             if userdata and userdata.button then
-                sm.worldgui.OnInteract(userdata.guiId, userdata.button, state, sm.localPlayer.getPlayer())
+                --sm.worldgui.OnInteract(userdata.guiId, userdata.button, state, sm.localPlayer.getPlayer())
+                sm.event.sendToTool(g_worldGuiManager.tool, "OnInteract", { userdata.guiId, userdata.button, sm.localPlayer.getPlayer(), state})
             end
         end
     end
