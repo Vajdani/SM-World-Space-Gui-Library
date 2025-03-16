@@ -332,6 +332,7 @@ WorldGui.widgetTypeCallbacks = {
 ---@field transform WorldGuiTransform
 ---@field parent? string
 ---@field zIndex number
+---@field vis? Effect
 
 ---@class WorldGuiInterface
 ---@field id number
@@ -357,6 +358,7 @@ WorldGui.widgetTypeCallbacks = {
 ---@field setSliderFraction function
 ---@field getSliderFraction function
 ---@field createWidget function
+---@field vis? Effect
 
 ---@param gui WorldGuiInterface
 ---@param widgets WorldGuiLayout
